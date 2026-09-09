@@ -1,14 +1,19 @@
-"""Modelo de linguagem e embeddings.
+"""Modelos de linguagem e embeddings.
 
-As duas classes do pacote estão aqui, e existem porque carregam modelo e
-tokenizador. O resto do agentkit é função.
+LLM carrega o modelo na máquina com transformers, e LLMAPI conversa com um
+endpoint no formato chat completions da OpenAI. As duas têm a mesma superfície,
+e é por isso que o agente e a memória funcionam com qualquer uma delas sem saber
+de onde vem a resposta. O resto do agentkit é função.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import os
 import time
+import urllib.error
+import urllib.request
 
 import numpy as np
 import torch
@@ -176,6 +181,251 @@ def parse_tool_calls(text: str) -> list[dict]:
         if isinstance(call.get("name"), str):
             calls.append({"name": call["name"], "arguments": call.get("arguments", {})})
     return calls
+
+
+class LLMAPI:
+    """Modelo servido por uma API no formato chat completions da OpenAI.
+
+    Tem a mesma superfície do LLM — invoke, bind_tools, generate_structured e o
+    registro em last_usage — para que o agente e a memória não precisem saber de
+    onde vem a resposta. Serve qualquer endpoint que fale esse formato, e a
+    diferença entre eles é a base_url.
+    """
+
+    def __init__(
+        self,
+        model: str,
+        api_key: str | None = None,
+        base_url: str = "https://api.openai.com/v1",
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        max_tokens: int = 512,
+        parallel_tool_calls: bool = False,
+    ) -> None:
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+        if not self.api_key:
+            raise ValueError("Informe api_key ou defina a variável OPENAI_API_KEY.")
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        # O laço do agente executa uma ferramenta por passo, e este parâmetro
+        # pede o mesmo ao provedor, em vez de descartar as chamadas extras.
+        self.parallel_tool_calls = parallel_tool_calls
+        self.tools: list[dict] = []
+        self.last_usage: dict = {}
+        self.usage: list[dict] = []
+
+    def complete(self, messages: list[dict], response_format: dict | None = None, **kwargs) -> dict:
+        """Envia a conversa e devolve a mensagem crua da API, registrando o uso.
+
+        É o único ponto da classe que fala HTTP. Os outros métodos montam o que
+        entra aqui e traduzem o que sai.
+        """
+        payload = {
+            "model": self.model,
+            "messages": to_api_messages(messages),
+            "temperature": kwargs.get("temperature", self.temperature),
+            "top_p": kwargs.get("top_p", self.top_p),
+            "max_tokens": kwargs.get("max_tokens", self.max_tokens),
+        }
+        if self.tools:
+            payload["tools"] = to_api_tools(self.tools)
+            payload["parallel_tool_calls"] = self.parallel_tool_calls
+        if response_format is not None:
+            payload["response_format"] = response_format
+
+        started = time.perf_counter()
+        data = post(f"{self.base_url}/chat/completions", payload, self.api_key)
+        usage = data.get("usage") or {}
+        self.last_usage = {
+            "tokens_in": usage.get("prompt_tokens", 0),
+            "tokens_out": usage.get("completion_tokens", 0),
+            "seconds": round(time.perf_counter() - started, 3),
+            "model": self.model,
+        }
+        self.usage.append(self.last_usage)
+        return data["choices"][0]["message"]
+
+    def generate(self, prompt: str, **kwargs) -> str:
+        """Gera texto a partir de uma string.
+
+        A API não continua prompt cru: o mais próximo disso é uma conversa de
+        uma mensagem só, e é essa a diferença para o LLM local.
+        """
+        return self.complete([{"role": "user", "content": prompt}], **kwargs).get("content") or ""
+
+    def chat(self, messages: list[dict], **kwargs) -> str | dict:
+        """Envia a conversa e devolve a resposta.
+
+        Com ferramentas ligadas por bind_tools, devolve a mensagem do assistente
+        em vez do texto, com a chave tool_calls quando o modelo pede uma chamada.
+        """
+        message = self.complete(messages, **kwargs)
+        if not self.tools:
+            return message.get("content") or ""
+        return from_api_message(message)
+
+    def invoke(self, input: str | list[dict], **kwargs) -> str | dict:
+        """Encaminha string para generate e lista de mensagens para chat."""
+        if isinstance(input, str):
+            return self.generate(input, **kwargs)
+        return self.chat(input, **kwargs)
+
+    def bind_tools(self, tools: list) -> "LLMAPI":
+        """Devolve uma cópia do modelo com as ferramentas ligadas às chamadas."""
+        bound = copy.copy(self)
+        bound.tools = [fn.tool_schema for fn in tools]
+        return bound
+
+    def generate_structured(
+        self,
+        prompt_or_messages: str | list[dict],
+        schema: type,
+        max_tokens: int | None = None,
+    ) -> object:
+        """Gera uma saída forçada pelo esquema e devolve o objeto validado.
+
+        O mecanismo é outro: no LLM local a gramática restringe a amostragem, e
+        aqui o esquema vai no response_format e quem restringe é o provedor.
+        """
+        messages = (
+            [{"role": "user", "content": prompt_or_messages}]
+            if isinstance(prompt_or_messages, str)
+            else prompt_or_messages
+        )
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": schema.__name__,
+                "schema": to_api_schema(schema),
+                "strict": True,
+            },
+        }
+        message = self.complete(
+            messages, response_format=response_format, max_tokens=max_tokens or self.max_tokens
+        )
+        return schema.model_validate_json(message["content"])
+
+
+def post(url: str, payload: dict, api_key: str) -> dict:
+    """Envia o JSON e devolve a resposta, com a biblioteca padrão.
+
+    Sem SDK de propósito: o corpo da requisição é o mesmo que a documentação do
+    provedor mostra, e dá para ler o que sai daqui. O User-Agent é obrigatório
+    porque provedores atrás de CDN recusam o que o urllib manda por padrão.
+    """
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "agentkit",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError(f"{error.code} {error.reason}: {error.read().decode('utf-8')}") from error
+
+
+def to_api_tools(schemas: list[dict]) -> list[dict]:
+    """Traduz o esquema de ferramenta do curso para o formato de function calling."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": schema["name"],
+                "description": schema["description"],
+                "parameters": {
+                    "type": "object",
+                    "properties": schema["parameters"],
+                    "required": schema["required"],
+                },
+            },
+        }
+        for schema in schemas
+    ]
+
+
+def to_api_messages(messages: list[dict]) -> list[dict]:
+    """Traduz as mensagens do curso para o formato da API.
+
+    A API exige que cada mensagem tool aponte para a chamada que a originou. O
+    formato do curso não guarda esse identificador, então ele é criado aqui, por
+    posição, e só precisa ser consistente dentro desta requisição.
+    """
+    api_messages = []
+    pending: list[str] = []
+    for message in messages:
+        if message["role"] == "assistant" and message.get("tool_calls"):
+            calls = []
+            for call in message["tool_calls"]:
+                identifier = f"call_{len(pending) + len(calls)}"
+                calls.append(
+                    {
+                        "id": identifier,
+                        "type": "function",
+                        "function": {
+                            "name": call["name"],
+                            "arguments": json.dumps(call.get("arguments", {})),
+                        },
+                    }
+                )
+            pending.extend(call["id"] for call in calls)
+            api_messages.append(
+                {"role": "assistant", "content": message.get("content") or "", "tool_calls": calls}
+            )
+        elif message["role"] == "tool":
+            if not pending:
+                raise ValueError("mensagem tool sem chamada correspondente no histórico")
+            api_messages.append(
+                {"role": "tool", "tool_call_id": pending.pop(0), "content": message["content"]}
+            )
+        else:
+            api_messages.append({"role": message["role"], "content": message["content"]})
+    return api_messages
+
+
+def from_api_message(message: dict) -> dict:
+    """Traduz a mensagem do assistente devolvida pela API para o formato do curso."""
+    calls = message.get("tool_calls") or []
+    assistant = {"role": "assistant", "content": message.get("content") or ""}
+    if not calls:
+        return assistant
+    assistant["tool_calls"] = [
+        {
+            "name": call["function"]["name"],
+            "arguments": json.loads(call["function"]["arguments"] or "{}"),
+        }
+        for call in calls
+    ]
+    return assistant
+
+
+def to_api_schema(schema: type) -> dict:
+    """Devolve o esquema JSON do Pydantic no formato que a saída estruturada exige.
+
+    O modo estrito do provedor pede que todo objeto proíba campos extras e
+    declare todos os seus campos como obrigatórios, coisas que o Pydantic não
+    escreve sozinho.
+    """
+    def fix(node):
+        if isinstance(node, list):
+            return [fix(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        node = {key: fix(value) for key, value in node.items()}
+        if node.get("type") == "object":
+            node["additionalProperties"] = False
+            node["required"] = list(node.get("properties", {}))
+        return node
+
+    return fix(schema.model_json_schema())
 
 
 class Embeddings:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import io
 import json
 import inspect
+from contextlib import redirect_stdout
 from typing import Callable
 
 TOOL_SYSTEM_PROMPT = """You have access to the tools below.
@@ -54,6 +57,39 @@ def tool(fn: Callable) -> Callable:
         "required": required,
     }
     return fn
+
+
+# O estado do interpretador do agente. As variáveis criadas em uma chamada
+# continuam disponíveis na seguinte, como acontece entre células de um notebook.
+PYTHON_STATE: dict = {}
+
+
+@tool
+def run_python(code: str) -> str:
+    """Run Python code and return what it printed, or the value of the last expression.
+
+    A única ferramenta pronta do pacote, porque executar código é o que permite a
+    um agente resolver o que nenhuma ferramenta específica cobre.
+    """
+    buffer = io.StringIO()
+    try:
+        block = ast.parse(code)
+        # O exec não devolve valor, então a última expressão é avaliada à parte.
+        # Sem isso o modelo escreve `total` esperando ver o número, não vê nada e
+        # completa a lacuna com um valor inventado.
+        last = block.body.pop() if block.body else None
+        value = None
+        with redirect_stdout(buffer):
+            exec(compile(block, "<agente>", "exec"), PYTHON_STATE)
+            if isinstance(last, ast.Expr):
+                value = eval(compile(ast.Expression(last.value), "<agente>", "eval"), PYTHON_STATE)
+            elif last is not None:
+                exec(compile(ast.Module([last], type_ignores=[]), "<agente>", "exec"), PYTHON_STATE)
+    except Exception as error:
+        return f"{type(error).__name__}: {error}"
+    printed = buffer.getvalue().strip()
+    # Observação longa demais ocupa o contexto sem informar.
+    return (printed or ("" if value is None else repr(value)) or "ok")[:400]
 
 
 def render_tools(tools: list[Callable]) -> str:
